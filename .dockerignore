@@ -35,6 +35,10 @@ Makefile
 *_test.go
 *.test
 
+# Reference code (analysis only)
+evo que funciona*/
+ANALISE-CORRECOES-CAROUSEL-PIX.md
+
 # Manager/dist é necessário - serve arquivos estáticos do frontend React
 # Não excluir - precisa estar na imagem final para ser acessado via /manager
 

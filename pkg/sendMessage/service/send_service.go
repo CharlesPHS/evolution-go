@@ -3,12 +3,12 @@ package send_service
 import (
 	"bytes"
 	"context"
+	crypto_rand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
-	"image/jpeg"
 	"image/png"
 	"io"
 	"mime/multipart"
@@ -27,6 +27,7 @@ import (
 	"github.com/chai2010/webp"
 	"github.com/gabriel-vasile/mimetype"
 	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"golang.org/x/net/html"
@@ -45,6 +46,7 @@ type SendService interface {
 	SendButton(data *ButtonStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendList(data *ListStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendCarousel(data *CarouselStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
+	SendPix(data *PixStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendStatusText(data *StatusTextStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendStatusMediaUrl(data *StatusMediaStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendStatusMediaFile(data *StatusMediaStruct, fileData []byte, instance *instance_model.Instance) (*MessageSendStruct, error)
@@ -58,14 +60,15 @@ type sendService struct {
 }
 
 type SendDataStruct struct {
-	Id           string
-	Number       string
-	Delay        int32
-	MentionAll   bool
-	MentionedJID []string
-	FormatJid    *bool
-	Quoted       QuotedStruct
-	MediaHandle  string
+	Id              string
+	Number          string
+	Delay           int32
+	MentionAll      bool
+	MentionedJID    []string
+	FormatJid       *bool
+	Quoted          QuotedStruct
+	MediaHandle     string
+	AdditionalNodes *[]waBinary.Node
 }
 
 type QuotedStruct struct {
@@ -162,193 +165,157 @@ type ContactStruct struct {
 	Quoted       QuotedStruct      `json:"quoted"`
 }
 
-// Button represents a single interactive button for /send/button.
-// The `type` field drives which of the other fields are used:
-//   - reply: uses `displayText` + `id`
-//   - copy:  uses `displayText` + `copyCode`
-//   - url:   uses `displayText` + `url`
-//   - call:  uses `displayText` + `phoneNumber`
-//   - pix:   uses `currency` + `name` + `keyType` + `key` (must be sent alone)
 type Button struct {
-	// Button kind. One of: reply, copy, url, call, pix.
-	Type        string `json:"type" enums:"reply,copy,url,call,pix" example:"reply"`
-	// Label rendered inside the button (reply / copy / url / call). Ignored for pix.
-	DisplayText string `json:"displayText" example:"Quero saber mais"`
-	// Callback payload for `reply` or code-to-copy internal id for `copy`.
-	Id          string `json:"id" example:"btn_info"`
-	// Code placed in the clipboard when type=copy.
-	CopyCode    string `json:"copyCode,omitempty" example:"PROMO2026"`
-	// Target URL when type=url.
-	URL         string `json:"url,omitempty" example:"https://evolutionapi.com"`
-	// Destination phone number (E.164) when type=call.
-	PhoneNumber string `json:"phoneNumber,omitempty" example:"+5582988898565"`
-	// ISO currency code for type=pix (e.g. BRL).
-	Currency    string `json:"currency,omitempty" example:"BRL"`
-	// Merchant display name shown on the Pix sheet.
-	Name        string `json:"name,omitempty" example:"Minha Loja"`
-	// Pix key type. One of: phone, email, cpf, cnpj, random.
-	KeyType     string `json:"keyType,omitempty" enums:"phone,email,cpf,cnpj,random" example:"cpf"`
-	// Pix key value matching the keyType.
-	Key         string `json:"key,omitempty" example:"12345678900"`
+	Type        string        `json:"type"`
+	DisplayText string        `json:"displayText"`
+	Id          string        `json:"id"`
+	CopyCode    string        `json:"copyCode"`
+	URL         string        `json:"url"`
+	PhoneNumber string        `json:"phoneNumber"`
+	Currency    string        `json:"currency"`
+	Name        string        `json:"name"`
+	KeyType     string        `json:"keyType"`
+	Key         string        `json:"key"`
+	CatalogID   string        `json:"catalogId,omitempty"`
+	Items       []PaymentItem `json:"items,omitempty"`
 }
 
-// ButtonStruct is the body for POST /send/button.
-//
-// Server-side validation:
-//   - up to 3 `reply` buttons per message;
-//   - `reply` cannot be mixed with any other type;
-//   - `pix` must be the only button in the message.
-//
-// WhatsApp Web rendering quirk (NOT enforced by the server):
-//   - mixing `reply` with CTA buttons (copy/url/call) makes the message invisible on WhatsApp Web;
-//   - safe combinations: only-reply (up to 3) OR grouped CTAs (copy + url + call).
+type PaymentItem struct {
+	Name       string `json:"name"`
+	Amount     int    `json:"amount"`
+	Quantity   int    `json:"quantity"`
+	RetailerID string `json:"retailerId,omitempty"`
+}
+
 type ButtonStruct struct {
-	// Destination phone number.
-	Number       string       `json:"number" example:"5582988898565"`
-	// Header title (required).
-	Title        string       `json:"title" example:"Oferta especial"`
-	// Body description text (required).
-	Description  string       `json:"description" example:"Confira as condicoes abaixo"`
-	// Footer text (required).
-	Footer       string       `json:"footer" example:"Evolution GO"`
-	// Buttons array. See combination rules on the parent type description.
+	Number       string       `json:"number"`
+	Title        string       `json:"title"`
+	Description  string       `json:"description"`
+	Footer       string       `json:"footer"`
 	Buttons      []Button     `json:"buttons"`
-	// Typing delay (milliseconds) applied before sending the message.
-	Delay        int32        `json:"delay,omitempty" example:"1200"`
-	// JIDs to mention inside the body text.
-	MentionedJID []string     `json:"mentionedJid,omitempty"`
-	// Mention every participant (groups only).
-	MentionAll   bool         `json:"mentionAll,omitempty"`
-	// If false, skips automatic formatting/validation of `number` into a JID.
+	ImageUrl     string       `json:"imageUrl,omitempty"`
+	VideoUrl     string       `json:"videoUrl,omitempty"`
+	Delay        int32        `json:"delay"`
+	MentionedJID []string     `json:"mentionedJid"`
+	MentionAll   bool         `json:"mentionAll"`
 	FormatJid    *bool        `json:"formatJid,omitempty"`
-	// Quoted (reply-to) context.
-	Quoted       QuotedStruct `json:"quoted,omitempty"`
+	Quoted       QuotedStruct `json:"quoted"`
 }
 
-// Row is a selectable item inside a list Section.
 type Row struct {
-	// Row main label.
-	Title       string `json:"title" example:"Plano Basico"`
-	// Optional secondary line below the title.
-	Description string `json:"description,omitempty" example:"R$ 29,90/mes"`
-	// Callback payload returned when the user taps the row. Auto-generated if empty.
-	RowId       string `json:"rowId,omitempty" example:"plan_basic"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	RowId       string `json:"rowId"`
 }
 
-// Section groups related Rows under an optional title.
 type Section struct {
-	// Section heading (optional; rendered as a group separator).
-	Title string `json:"title,omitempty" example:"Planos"`
-	// Rows inside this section.
+	Title string `json:"title"`
 	Rows  []Row  `json:"rows"`
 }
 
-// ListStruct is the body for POST /send/list.
-//
-// Renders as a single-select menu (legacy ListMessage format — compatible with iOS, Android and WhatsApp Web).
 type ListStruct struct {
-	// Destination phone number.
-	Number       string       `json:"number" example:"5582988898565"`
-	// Header title (required).
-	Title        string       `json:"title" example:"Nossos planos"`
-	// Body description text (required).
-	Description  string       `json:"description" example:"Escolha o plano ideal para voce"`
-	// Label of the button that opens the list. Defaults to "Ver Menu" when empty.
-	ButtonText   string       `json:"buttonText" example:"Abrir cardapio"`
-	// Footer text (required).
-	FooterText   string       `json:"footerText" example:"Evolution GO"`
-	// Sections with rows. At least one section with one row is required.
+	Number       string       `json:"number"`
+	Title        string       `json:"title"`
+	Description  string       `json:"description"`
+	ButtonText   string       `json:"buttonText"`
+	FooterText   string       `json:"footerText"`
 	Sections     []Section    `json:"sections"`
-	// Typing delay (milliseconds) applied before sending the message.
-	Delay        int32        `json:"delay,omitempty" example:"1200"`
-	// JIDs to mention inside the body text.
-	MentionedJID []string     `json:"mentionedJid,omitempty"`
-	// Mention every participant (groups only).
-	MentionAll   bool         `json:"mentionAll,omitempty"`
-	// If false, skips automatic formatting/validation of `number` into a JID.
+	Delay        int32        `json:"delay"`
+	MentionedJID []string     `json:"mentionedJid"`
+	MentionAll   bool         `json:"mentionAll"`
 	FormatJid    *bool        `json:"formatJid,omitempty"`
-	// Quoted (reply-to) context.
-	Quoted       QuotedStruct `json:"quoted,omitempty"`
+	Quoted       QuotedStruct `json:"quoted"`
 }
 
-// CarouselButtonStruct is a button attached to a single carousel card.
-//
-// IMPORTANT — this struct is different from `Button` (used in /send/button):
-// it has NO dedicated `url` or `phoneNumber` fields. For URL and CALL buttons
-// you must put the link / phone number in the `id` field.
-//
-//   - REPLY (default): uses `displayText` + `id` as callback payload.
-//   - URL:   uses `displayText` + `id` (put the URL here).
-//   - CALL:  uses `displayText` + `id` (put the phone number here).
-//   - COPY:  uses `displayText` + `copyCode`.
-//
-// PIX buttons are NOT supported inside carousel cards — use /send/button instead.
-//
-// WhatsApp Web rendering quirk (NOT enforced by the server):
-// avoid mixing REPLY with CTA buttons (URL/CALL/COPY) in the same card —
-// mixed sets do not render on WhatsApp Web. Prefer only-REPLY or only-CTAs per card.
 type CarouselButtonStruct struct {
-	// Button kind (case-insensitive). One of: REPLY (default), URL, CALL, COPY.
-	Type        string `json:"type" enums:"REPLY,URL,CALL,COPY,reply,url,call,copy" example:"REPLY"`
-	// Label rendered inside the button.
-	DisplayText string `json:"displayText" example:"Quero saber mais"`
-	// Context-dependent: REPLY payload, URL target (type=URL) or phone number (type=CALL).
-	Id          string `json:"id" example:"card1_info"`
-	// Code placed in the clipboard when type=COPY.
-	CopyCode    string `json:"copyCode,omitempty" example:"PROMO2026"`
+	Type        string `json:"type"`
+	DisplayText string `json:"displayText"`
+	Id          string `json:"id"`
+	CopyCode    string `json:"copyCode,omitempty"`
+	URL         string `json:"url,omitempty"`
+	PhoneNumber string `json:"phoneNumber,omitempty"`
 }
 
-// CarouselCardHeaderStruct is the top area of a carousel card.
-// Either `imageUrl` OR `videoUrl` may be provided (image takes precedence when both are set).
 type CarouselCardHeaderStruct struct {
-	// Optional visible title above the media.
-	Title    string `json:"title,omitempty" example:"Oferta do dia"`
-	// Optional subtitle rendered below the title.
-	Subtitle string `json:"subtitle,omitempty" example:"Somente hoje"`
-	// Public URL to an image. Downloaded, uploaded to WhatsApp servers and used as card media.
-	ImageUrl string `json:"imageUrl,omitempty" example:"https://picsum.photos/seed/card1/600/400"`
-	// Public URL to a video. Used only when `imageUrl` is empty.
+	Title    string `json:"title"`
+	Subtitle string `json:"subtitle"`
+	ImageUrl string `json:"imageUrl,omitempty"`
 	VideoUrl string `json:"videoUrl,omitempty"`
 }
 
-// CarouselCardBodyStruct is the text area of a carousel card.
 type CarouselCardBodyStruct struct {
-	// Main text of the card.
-	Text string `json:"text" example:"Card 1 - Oferta especial"`
+	Text string `json:"text"`
 }
 
-// CarouselCardStruct is a single card inside a carousel message.
-// Each card requires at least `header` + `body`.
 type CarouselCardStruct struct {
-	// Card header (media + title/subtitle).
 	Header  CarouselCardHeaderStruct `json:"header"`
-	// Card body text (required).
 	Body    CarouselCardBodyStruct   `json:"body"`
-	// Optional footer rendered under the body.
-	Footer  string                   `json:"footer,omitempty" example:"Por tempo limitado"`
-	// Buttons shown on the card. See CarouselButtonStruct for combination rules.
+	Footer  string                   `json:"footer,omitempty"`
 	Buttons []CarouselButtonStruct   `json:"buttons,omitempty"`
 }
 
-// CarouselStruct is the body for POST /send/carousel.
-//
-// Sends an interactive carousel of swipeable cards. At least one card is required.
-// Each card must have `header` + `body`; button rules are described on CarouselButtonStruct.
 type CarouselStruct struct {
-	// Destination phone number.
-	Number    string               `json:"number" example:"5582988898565"`
-	// Optional message body shown above the cards.
-	Body      string               `json:"body,omitempty" example:"Confira nossas novidades!"`
-	// Optional message footer shown below the cards.
-	Footer    string               `json:"footer,omitempty" example:"Evolution GO"`
-	// Typing delay (milliseconds) applied before sending the message.
-	Delay     int32                `json:"delay,omitempty" example:"1200"`
-	// If false, skips automatic formatting/validation of `number` into a JID.
-	FormatJid *bool                `json:"formatJid,omitempty"`
-	// Quoted (reply-to) context.
-	Quoted    QuotedStruct         `json:"quoted,omitempty"`
-	// Cards displayed in order. At least one card is required.
+	Number    string             `json:"number"`
+	Body      string             `json:"body,omitempty"`
+	Footer    string             `json:"footer,omitempty"`
+	Delay     int32              `json:"delay"`
+	FormatJid *bool              `json:"formatJid,omitempty"`
+	Quoted    QuotedStruct       `json:"quoted"`
 	Cards     []CarouselCardStruct `json:"cards"`
+}
+
+type PixStruct struct {
+	Number       string       `json:"number"`
+	HeaderTitle  string       `json:"headerTitle"`
+	BodyText     string       `json:"bodyText"`
+	FooterText   string       `json:"footerText,omitempty"`
+	MerchantName string       `json:"merchantName"`
+	PixKey       string       `json:"pixKey"`
+	KeyType      string       `json:"keyType"`
+	Delay        int32        `json:"delay"`
+	MentionedJID []string     `json:"mentionedJid"`
+	MentionAll   bool         `json:"mentionAll"`
+	FormatJid    *bool        `json:"formatJid,omitempty"`
+	Quoted       QuotedStruct `json:"quoted"`
+}
+
+type pixPaymentPayload struct {
+	Currency        string              `json:"currency"`
+	ReferenceID     string              `json:"reference_id"`
+	Type            string              `json:"type"`
+	TotalAmount     pixAmount           `json:"total_amount"`
+	Order           pixOrder            `json:"order"`
+	PaymentSettings []pixPaymentSetting `json:"payment_settings"`
+}
+
+type pixAmount struct {
+	Value  int64 `json:"value"`
+	Offset int64 `json:"offset"`
+}
+
+type pixOrder struct {
+	Status    string    `json:"status"`
+	OrderType string    `json:"order_type"`
+	Subtotal  pixAmount `json:"subtotal"`
+	Items     []pixItem `json:"items"`
+}
+
+type pixItem struct {
+	Name       string    `json:"name"`
+	Amount     pixAmount `json:"amount"`
+	Quantity   int64     `json:"quantity"`
+	SaleAmount pixAmount `json:"sale_amount"`
+}
+
+type pixPaymentSetting struct {
+	Type          string        `json:"type"`
+	PixStaticCode pixStaticCode `json:"pix_static_code"`
+}
+
+type pixStaticCode struct {
+	MerchantName string `json:"merchant_name"`
+	Key          string `json:"key"`
+	KeyType      string `json:"key_type"`
 }
 
 type StatusTextStruct struct {
@@ -1690,14 +1657,150 @@ func mapKeyType(keyType string) string {
 	}
 }
 
+func (s *sendService) SendPix(data *PixStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
+	_, err := s.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate required fields
+	if data.MerchantName == "" {
+		return nil, errors.New("merchantName is required")
+	}
+	if data.PixKey == "" {
+		return nil, errors.New("pixKey is required")
+	}
+	if data.KeyType == "" {
+		return nil, errors.New("keyType is required (CPF, CNPJ, EMAIL, PHONE, EVP)")
+	}
+	data.KeyType = strings.ToUpper(data.KeyType)
+
+	// Build internal payment payload
+	defaultAmount := pixAmount{Value: 100, Offset: 100}
+	payload := pixPaymentPayload{
+		Currency:    "BRL",
+		ReferenceID: utils.GenerateRandomString(11),
+		Type:        "physical-goods",
+		TotalAmount: defaultAmount,
+		Order: pixOrder{
+			Status:    "pending",
+			OrderType: "ORDER",
+			Subtotal:  defaultAmount,
+			Items: []pixItem{
+				{
+					Name:       "Pix",
+					Amount:     defaultAmount,
+					Quantity:   1,
+					SaleAmount: defaultAmount,
+				},
+			},
+		},
+		PaymentSettings: []pixPaymentSetting{
+			{
+				Type: "pix_static_code",
+				PixStaticCode: pixStaticCode{
+					MerchantName: data.MerchantName,
+					Key:          data.PixKey,
+					KeyType:      data.KeyType,
+				},
+			},
+		},
+	}
+
+	paymentJSON, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal pix payment payload: %v", err)
+	}
+
+	// Build the NativeFlowMessage with a single "payment_info" button
+	protoButtons := []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+		{
+			Name:             proto.String("payment_info"),
+			ButtonParamsJSON: proto.String(string(paymentJSON)),
+		},
+	}
+
+	interactive := &waE2E.InteractiveMessage{
+		Header: &waE2E.InteractiveMessage_Header{
+			Title:              proto.String(data.HeaderTitle),
+			HasMediaAttachment: proto.Bool(false),
+		},
+		Body: &waE2E.InteractiveMessage_Body{Text: proto.String(data.BodyText)},
+		InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+				Buttons:           protoButtons,
+				MessageParamsJSON: proto.String(""),
+				MessageVersion:    proto.Int32(1),
+			},
+		},
+	}
+	if data.FooterText != "" {
+		interactive.Footer = &waE2E.InteractiveMessage_Footer{Text: proto.String(data.FooterText)}
+	}
+
+	msg := &waE2E.Message{
+		InteractiveMessage: interactive,
+		MessageContextInfo: &waE2E.MessageContextInfo{
+			DeviceListMetadataVersion: proto.Int32(2),
+			DeviceListMetadata:        &waE2E.DeviceListMetadata{},
+		},
+	}
+
+	// Build PIX-specific biz nodes
+	pixNodes := []waBinary.Node{
+		{
+			Tag: "biz",
+			Content: []waBinary.Node{{
+				Tag: "interactive",
+				Attrs: waBinary.Attrs{
+					"type": "native_flow",
+					"v":    "1",
+				},
+				Content: []waBinary.Node{{
+					Tag: "native_flow",
+					Attrs: waBinary.Attrs{
+						"name": "payment_info",
+					},
+				}},
+			}},
+		},
+	}
+	// Add bot node for 1:1 chats (not groups)
+	isGroup := strings.Contains(data.Number, "@g.us")
+	if !isGroup {
+		pixNodes = append(pixNodes, waBinary.Node{
+			Tag: "bot",
+			Attrs: waBinary.Attrs{
+				"biz_bot": "1",
+			},
+		})
+	}
+
+	message, err := s.SendMessage(instance, msg, "InteractiveMessage", &SendDataStruct{
+		Number:          data.Number,
+		Delay:           data.Delay,
+		MentionAll:      data.MentionAll,
+		MentionedJID:    data.MentionedJID,
+		FormatJid:       data.FormatJid,
+		Quoted:          data.Quoted,
+		AdditionalNodes: &pixNodes,
+	})
+	if err != nil {
+		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error sending pix message: %v", instance.Id, err)
+		return nil, err
+	}
+
+	return message, nil
+}
+
 func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
-	client, err := s.ensureClientConnected(instance.Id)
+	_, err := s.ensureClientConnected(instance.Id)
 	if err != nil {
 		return nil, err
 	}
 
 	hasReply := false
-	hasPix := false
+	hasPayment := false
 	hasOtherTypes := false
 	replyCount := 0
 
@@ -1706,8 +1809,8 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 		case "reply":
 			hasReply = true
 			replyCount++
-		case "pix":
-			hasPix = true
+		case "review_and_pay":
+			hasPayment = true
 		default:
 			hasOtherTypes = true
 		}
@@ -1722,9 +1825,12 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 		}
 	}
 
-	if hasPix {
+	if hasPayment {
 		if len(data.Buttons) > 1 {
-			return nil, errors.New("botão do tipo 'pix' não pode ser combinado com outros botões")
+			return nil, errors.New("botão do tipo 'review_and_pay' não pode ser combinado com outros botões")
+		}
+		if len(data.Buttons[0].Items) == 0 {
+			return nil, errors.New("botão do tipo 'review_and_pay' requer pelo menos 1 item")
 		}
 	}
 
@@ -1732,26 +1838,79 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 
 	for _, v := range data.Buttons {
 		var paramsJSON *string
-
 		var name *string
 
 		switch v.Type {
 		case "reply":
 			name = proto.String("quick_reply")
-			paramsJSON = proto.String(`{"display_text":"` + v.DisplayText + `","id":"` + v.Id + `"}`)
+			jsonBytes, _ := json.Marshal(map[string]string{"display_text": v.DisplayText, "id": v.Id})
+			paramsJSON = proto.String(string(jsonBytes))
 		case "copy":
 			name = proto.String("cta_copy")
-			paramsJSON = proto.String(`{"display_text":"` + v.DisplayText + `","copy_code":"` + v.CopyCode + `"}`)
+			copyCode := v.CopyCode
+			if copyCode == "" {
+				copyCode = v.Id
+			}
+			copyId := v.Id
+			if copyId == "" {
+				copyId = "copy_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+			}
+			jsonBytes, _ := json.Marshal(map[string]string{"display_text": v.DisplayText, "id": copyId, "copy_code": copyCode})
+			paramsJSON = proto.String(string(jsonBytes))
 		case "url":
 			name = proto.String("cta_url")
-			paramsJSON = proto.String(`{"display_text":"` + v.DisplayText + `","url":"` + v.URL + `","merchant_url":"` + v.URL + `"}`)
+			jsonBytes, _ := json.Marshal(map[string]string{"display_text": v.DisplayText, "url": v.URL, "merchant_url": v.URL})
+			paramsJSON = proto.String(string(jsonBytes))
 		case "call":
 			name = proto.String("cta_call")
-			paramsJSON = proto.String(`{"display_text":"` + v.DisplayText + `","phone_number":"` + v.PhoneNumber + `"}`)
-		case "pix":
-			randomId := utils.GenerateRandomString(11)
-			name = proto.String("payment_info")
-			paramsJSON = proto.String(`{"currency":"` + v.Currency + `","total_amount":{"value":0,"offset":100},"reference_id":"` + randomId + `","type":"physical-goods","order":{"status":"pending","subtotal":{"value":0,"offset":100},"order_type":"ORDER","items":[{"name":"","amount":{"value":0,"offset":100},"quantity":0,"sale_amount":{"value":0,"offset":100}}]},"payment_settings":[{"type":"pix_static_code","pix_static_code":{"merchant_name":"` + v.Name + `","key":"` + v.Key + `","key_type":"` + mapKeyType(v.KeyType) + `"}}],"share_payment_status":false}`)
+			jsonBytes, _ := json.Marshal(map[string]string{"display_text": v.DisplayText, "phone_number": v.PhoneNumber})
+			paramsJSON = proto.String(string(jsonBytes))
+		case "review_and_pay":
+			name = proto.String("review_and_pay")
+			currency := v.Currency
+			if currency == "" {
+				currency = "BRL"
+			}
+			referenceId := v.CatalogID
+			if referenceId == "" {
+				referenceId = utils.GenerateRandomString(11)
+			}
+			items := []map[string]interface{}{}
+			var subtotal int
+			for _, item := range v.Items {
+				itemAmount := item.Amount * item.Quantity
+				subtotal += itemAmount
+				retailerId := item.RetailerID
+				if retailerId == "" {
+					retailerId = referenceId
+				}
+				items = append(items, map[string]interface{}{
+					"name":        item.Name,
+					"amount":      map[string]interface{}{"value": item.Amount, "offset": 100},
+					"quantity":    item.Quantity,
+					"retailer_id": retailerId,
+				})
+			}
+			paymentPayload := map[string]interface{}{
+				"currency":     currency,
+				"total_amount": map[string]interface{}{"value": subtotal, "offset": 100},
+				"reference_id": referenceId,
+				"type":         "physical-goods",
+				"referral":     "chat_attachment",
+				"order": map[string]interface{}{
+					"status":     "payment_requested",
+					"subtotal":   map[string]interface{}{"value": subtotal, "offset": 100},
+					"order_type": "PAYMENT_REQUEST",
+					"catalog_id": referenceId,
+					"items":      items,
+				},
+				"payment_settings": []map[string]interface{}{
+					{"type": "pix_static_code", "pix_static_code": map[string]string{"merchant_name": v.Name, "key": v.Key, "key_type": mapKeyType(v.KeyType)}},
+				},
+				"share_payment_status": false,
+			}
+			jsonBytes, _ := json.Marshal(paymentPayload)
+			paramsJSON = proto.String(string(jsonBytes))
 		}
 
 		buttons = append(buttons, &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
@@ -1760,111 +1919,258 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 		})
 	}
 
-	messageId := client.GenerateMessageID()
-	templateId := strconv.FormatInt(time.Now().UnixNano()/1000000, 10)
-	messageParamsJSON := `{"from":"api","templateId":` + templateId + `}`
-
 	var msg *waE2E.Message
+	var msgType string
 
-	if hasPix {
+	// Generate MessageSecret (32 random bytes) required for iOS to render interactive messages
+	btnMsgSecret := make([]byte, 32)
+	crypto_rand.Read(btnMsgSecret)
+
+	if hasReply && !hasOtherTypes && !hasPayment {
+		// Reply-only buttons: use native ButtonsMessage wrapped in DocumentWithCaptionMessage
+		var replyButtons []*waE2E.ButtonsMessage_Button
+		for _, v := range data.Buttons {
+			replyButtons = append(replyButtons, &waE2E.ButtonsMessage_Button{
+				ButtonID: proto.String(v.Id),
+				ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
+					DisplayText: proto.String(v.DisplayText),
+				},
+				Type: waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
+			})
+		}
+
+		buttonsMsg := &waE2E.ButtonsMessage{
+			ContentText: proto.String(data.Description),
+			FooterText:  proto.String(data.Footer),
+			HeaderType:  waE2E.ButtonsMessage_EMPTY.Enum(),
+			Buttons:     replyButtons,
+		}
+
+		// If imageUrl is provided, download, upload and set as header
+		if data.ImageUrl != "" {
+			resp, err := http.Get(data.ImageUrl)
+			if err == nil {
+				fileData, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					client, _ := s.ensureClientConnected(instance.Id)
+					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaImage)
+					if err == nil {
+						buttonsMsg.HeaderType = waE2E.ButtonsMessage_IMAGE.Enum()
+						buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
+							ImageMessage: &waE2E.ImageMessage{
+								URL:           proto.String(uploaded.URL),
+								DirectPath:    proto.String(uploaded.DirectPath),
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      proto.String("image/jpeg"),
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    proto.Uint64(uint64(len(fileData))),
+							},
+						}
+					}
+				}
+			}
+		} else if data.VideoUrl != "" {
+			resp, err := http.Get(data.VideoUrl)
+			if err == nil {
+				fileData, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					client, _ := s.ensureClientConnected(instance.Id)
+					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo)
+					if err == nil {
+						buttonsMsg.HeaderType = waE2E.ButtonsMessage_VIDEO.Enum()
+						buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
+							VideoMessage: &waE2E.VideoMessage{
+								URL:           proto.String(uploaded.URL),
+								DirectPath:    proto.String(uploaded.DirectPath),
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      proto.String("video/mp4"),
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    proto.Uint64(uint64(len(fileData))),
+							},
+						}
+					}
+				}
+			}
+		}
+
 		msg = &waE2E.Message{
-			InteractiveMessage: &waE2E.InteractiveMessage{
-				InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
-					NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-						Buttons:           buttons,
-						MessageParamsJSON: &messageParamsJSON,
+			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{
+					ButtonsMessage: buttonsMsg,
+				},
+			},
+			MessageContextInfo: &waE2E.MessageContextInfo{
+				MessageSecret: btnMsgSecret,
+			},
+		}
+		msgType = "ButtonsMessage"
+	} else if hasPayment {
+		// review_and_pay: wrap in DocumentWithCaptionMessage
+		paymentMsgParams := `{"native_flow_name":"order_details","version":1}`
+
+		var interactiveBody *waE2E.InteractiveMessage_Body
+		if data.Title != "" {
+			bodyText := data.Title
+			interactiveBody = &waE2E.InteractiveMessage_Body{
+				Text: &bodyText,
+			}
+		}
+
+		msg = &waE2E.Message{
+			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{
+					InteractiveMessage: &waE2E.InteractiveMessage{
+						Body: interactiveBody,
+						InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+							NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+								Buttons:           buttons,
+								MessageParamsJSON: &paymentMsgParams,
+								MessageVersion:    proto.Int32(1),
+							},
+						},
 					},
 				},
 			},
+			MessageContextInfo: &waE2E.MessageContextInfo{
+				MessageSecret: btnMsgSecret,
+			},
 		}
+		msgType = "InteractiveMessage"
 	} else {
-		// Body carries only the description; title goes in the Header to avoid duplication.
-		bodyText := data.Description
-		if bodyText == "" {
-			bodyText = data.Title
-		}
+		// Mixed button types (url, copy, call) use InteractiveMessage DIRECT
+		body := func() string {
+			t := "*" + data.Title + "*"
+			if data.Description != "" {
+				t += "\n\n" + data.Description + "\n"
+			}
+			return t
+		}()
 
-		interactiveMsg := &waE2E.InteractiveMessage{
+		interactive := &waE2E.InteractiveMessage{
 			Body: &waE2E.InteractiveMessage_Body{
-				Text: &bodyText,
+				Text: &body,
 			},
 			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
 				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
 					Buttons:           buttons,
-					MessageParamsJSON: &messageParamsJSON,
+					MessageParamsJSON: proto.String(""),
 					MessageVersion:    proto.Int32(1),
 				},
 			},
-			ContextInfo: &waE2E.ContextInfo{},
 		}
-
 		if data.Footer != "" {
-			interactiveMsg.Footer = &waE2E.InteractiveMessage_Footer{
+			interactive.Footer = &waE2E.InteractiveMessage_Footer{
 				Text: &data.Footer,
 			}
 		}
 
-		if data.Title != "" {
-			interactiveMsg.Header = &waE2E.InteractiveMessage_Header{
-				Title:              proto.String(data.Title),
-				HasMediaAttachment: proto.Bool(false),
+		// Add image or video header if provided
+		if data.ImageUrl != "" {
+			resp, err := http.Get(data.ImageUrl)
+			if err == nil {
+				fileData, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					client, _ := s.ensureClientConnected(instance.Id)
+					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaImage)
+					if err == nil {
+						interactive.Header = &waE2E.InteractiveMessage_Header{
+							Title:              proto.String(""),
+							HasMediaAttachment: proto.Bool(true),
+							Media: &waE2E.InteractiveMessage_Header_ImageMessage{
+								ImageMessage: &waE2E.ImageMessage{
+									URL:           proto.String(uploaded.URL),
+									DirectPath:    proto.String(uploaded.DirectPath),
+									MediaKey:      uploaded.MediaKey,
+									Mimetype:      proto.String("image/jpeg"),
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    proto.Uint64(uint64(len(fileData))),
+								},
+							},
+						}
+					}
+				}
+			}
+		} else if data.VideoUrl != "" {
+			resp, err := http.Get(data.VideoUrl)
+			if err == nil {
+				fileData, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					client, _ := s.ensureClientConnected(instance.Id)
+					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo)
+					if err == nil {
+						interactive.Header = &waE2E.InteractiveMessage_Header{
+							Title:              proto.String(""),
+							HasMediaAttachment: proto.Bool(true),
+							Media: &waE2E.InteractiveMessage_Header_VideoMessage{
+								VideoMessage: &waE2E.VideoMessage{
+									URL:           proto.String(uploaded.URL),
+									DirectPath:    proto.String(uploaded.DirectPath),
+									MediaKey:      uploaded.MediaKey,
+									Mimetype:      proto.String("video/mp4"),
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    proto.Uint64(uint64(len(fileData))),
+								},
+							},
+						}
+					}
+				}
 			}
 		}
 
 		msg = &waE2E.Message{
-			InteractiveMessage: interactiveMsg,
+			InteractiveMessage: interactive,
+			MessageContextInfo: &waE2E.MessageContextInfo{
+				MessageSecret: btnMsgSecret,
+			},
 		}
+		msgType = "InteractiveMessage"
 	}
 
-	recipient, err := s.validateAndCheckUserExists(data.Number, data.FormatJid, &data.Quoted.MessageID, &data.Quoted.MessageID, instance)
-	if err != nil {
-		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error validating message fields or user check: %v", instance.Id, err)
-		return nil, err
-	}
-
-	if data.Delay > 0 {
-		err := client.SendChatPresence(context.Background(), recipient, types.ChatPresence("composing"), types.ChatPresenceMedia(""))
-		if err != nil {
-			return nil, err
-		}
-
-		time.Sleep(time.Duration(data.Delay) * time.Millisecond)
-
-		err = client.SendChatPresence(context.Background(), recipient, types.ChatPresence("paused"), types.ChatPresenceMedia(""))
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	response, err := client.SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: messageId})
-	if err != nil {
-		return nil, err
-	}
-
-	messageInfo := types.MessageInfo{
-		MessageSource: types.MessageSource{
-			Chat:     recipient,
-			Sender:   *client.Store.ID,
-			IsFromMe: true,
-			IsGroup:  false,
-		},
-		ID:        messageId,
-		Timestamp: time.Now(),
-		ServerID:  response.ServerID,
-		Type:      "ButtonMessage",
-	}
-
-	messageSent := &MessageSendStruct{
-		Info:    messageInfo,
-		Message: msg,
-		MessageContextInfo: &waE2E.ContextInfo{
-			StanzaID:      proto.String(data.Quoted.MessageID),
-			Participant:   proto.String(data.Quoted.Participant),
-			QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
+	// Build biz nodes for buttons/interactive messages
+	btnBizNodes := []waBinary.Node{
+		{
+			Tag: "biz",
+			Content: []waBinary.Node{{
+				Tag: "interactive",
+				Attrs: waBinary.Attrs{
+					"type": "native_flow",
+					"v":    "1",
+				},
+				Content: []waBinary.Node{{
+					Tag: "native_flow",
+					Attrs: waBinary.Attrs{
+						"v":    "9",
+						"name": "mixed",
+					},
+				}},
+			}},
 		},
 	}
 
-	return messageSent, nil
+	// Route through centralized SendMessage
+	message, err := s.SendMessage(instance, msg, msgType, &SendDataStruct{
+		Number:          data.Number,
+		Delay:           data.Delay,
+		MentionAll:      data.MentionAll,
+		MentionedJID:    data.MentionedJID,
+		FormatJid:       data.FormatJid,
+		Quoted:          data.Quoted,
+		AdditionalNodes: &btnBizNodes,
+	})
+	if err != nil {
+		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error sending button message: %v", instance.Id, err)
+		return nil, err
+	}
+
+	return message, nil
 }
 
 func stringPointer(s string) *string {
@@ -1873,16 +2179,15 @@ func stringPointer(s string) *string {
 
 func sectionsToString(data *ListStruct) (string, error) {
 	type row struct {
-		Header      string `json:"header"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		ID          string `json:"id"`
+		Header      *string `json:"header,omitempty"`
+		Title       string  `json:"title"`
+		Description *string `json:"description,omitempty"`
+		ID          string  `json:"id"`
 	}
 
 	type listSection struct {
-		Title          string `json:"title"`
-		HighlightLabel string `json:"highlight_label"`
-		Rows           []row  `json:"rows"`
+		Title string `json:"title"`
+		Rows  []row  `json:"rows"`
 	}
 
 	type list struct {
@@ -1893,40 +2198,18 @@ func sectionsToString(data *ListStruct) (string, error) {
 	sections := []listSection{}
 
 	for _, s := range data.Sections {
-		sectionTitle := s.Title
-		if sectionTitle == "" {
-			sectionTitle = " "
-		}
 		rows := []row{}
-
 		for _, r := range s.Rows {
-			rowTitle := r.Title
-			if rowTitle == "" {
-				rowTitle = " "
-			}
-			rowDesc := r.Description
-			if rowDesc == "" {
-				rowDesc = " "
-			}
-			rowId := r.RowId
-			if rowId == "" {
-				rowId = fmt.Sprintf("row_%d", len(rows))
-			}
 			rows = append(rows, row{
-				Header:      rowTitle,
-				Title:       rowTitle,
-				Description: rowDesc,
-				ID:          rowId,
+				Title:       r.Title,
+				Description: stringPointer(r.Description),
+				ID:          r.RowId,
 			})
 		}
-
-		section := listSection{
-			Title:          sectionTitle,
-			HighlightLabel: "",
-			Rows:           rows,
-		}
-
-		sections = append(sections, section)
+		sections = append(sections, listSection{
+			Title: s.Title,
+			Rows:  rows,
+		})
 	}
 
 	buttonText := data.ButtonText
@@ -1948,69 +2231,85 @@ func sectionsToString(data *ListStruct) (string, error) {
 }
 
 func (s *sendService) SendList(data *ListStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
-	// Legacy ListMessage format - works on iOS, Android and Web
-	// Matching PAPI Node.js default (non-modern) path exactly
+	_, err := s.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build native ListMessage sections
+	var sections []*waE2E.ListMessage_Section
+	for _, section := range data.Sections {
+		var rows []*waE2E.ListMessage_Row
+		for _, row := range section.Rows {
+			rows = append(rows, &waE2E.ListMessage_Row{
+				Title:       proto.String(row.Title),
+				Description: proto.String(row.Description),
+				RowID:       proto.String(row.RowId),
+			})
+		}
+		sections = append(sections, &waE2E.ListMessage_Section{
+			Title: proto.String(section.Title),
+			Rows:  rows,
+		})
+	}
+
+	// Generate MessageSecret (32 random bytes)
+	listMsgSecret := make([]byte, 32)
+	crypto_rand.Read(listMsgSecret)
 
 	buttonText := data.ButtonText
 	if buttonText == "" {
 		buttonText = "Ver Menu"
 	}
 
-	// Build sections in legacy ListMessage format
-	var sections []*waE2E.ListMessage_Section
-	for _, sec := range data.Sections {
-		sectionTitle := sec.Title
-		if sectionTitle == "" {
-			sectionTitle = " "
-		}
-		var rows []*waE2E.ListMessage_Row
-		for i, r := range sec.Rows {
-			rowTitle := r.Title
-			if rowTitle == "" {
-				rowTitle = " "
-			}
-			rowId := r.RowId
-			if rowId == "" {
-				rowId = fmt.Sprintf("row_%d_%d", i, len(rows))
-			}
-			rows = append(rows, &waE2E.ListMessage_Row{
-				Title:       proto.String(rowTitle),
-				Description: proto.String(r.Description),
-				RowID:       proto.String(rowId),
-			})
-		}
-		sections = append(sections, &waE2E.ListMessage_Section{
-			Title: proto.String(sectionTitle),
-			Rows:  rows,
-		})
-	}
-
-	listType := waE2E.ListMessage_SINGLE_SELECT
-	listMessage := &waE2E.ListMessage{
-		Title:       proto.String(data.Title),
-		Description: proto.String(data.Description),
-		ButtonText:  proto.String(buttonText),
-		FooterText:  proto.String(data.FooterText),
-		ListType:    &listType,
-		Sections:    sections,
-	}
-
-	// Send as plain ListMessage (NO ViewOnceMessage wrapper) - matching PAPI Node.js
+	// Wrap ListMessage in DocumentWithCaptionMessage as required by modern WhatsApp protocol
 	msg := &waE2E.Message{
-		ListMessage: listMessage,
+		DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{
+				ListMessage: &waE2E.ListMessage{
+					Title:       proto.String(data.Title),
+					Description: proto.String(data.Description),
+					ButtonText:  proto.String(buttonText),
+					ListType:    waE2E.ListMessage_SINGLE_SELECT.Enum(),
+					Sections:    sections,
+					FooterText:  proto.String(data.FooterText),
+				},
+			},
+		},
+		MessageContextInfo: &waE2E.MessageContextInfo{
+			MessageSecret: listMsgSecret,
+		},
 	}
 
-	message, err := s.SendMessage(instance, msg, "ListMessage", &SendDataStruct{
-		Number: data.Number,
-		Delay:  data.Delay,
-	})
+	// Build biz nodes for list messages
+	listBizNodes := []waBinary.Node{
+		{
+			Tag: "biz",
+			Content: []waBinary.Node{{
+				Tag: "list",
+				Attrs: waBinary.Attrs{
+					"type": "product_list",
+					"v":    "2",
+				},
+			}},
+		},
+	}
 
+	// Route through centralized SendMessage
+	message, err := s.SendMessage(instance, msg, "ListMessage", &SendDataStruct{
+		Number:          data.Number,
+		Delay:           data.Delay,
+		MentionAll:      data.MentionAll,
+		MentionedJID:    data.MentionedJID,
+		FormatJid:       data.FormatJid,
+		Quoted:          data.Quoted,
+		AdditionalNodes: &listBizNodes,
+	})
 	if err != nil {
-		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error sending list: %v", instance.Id, err)
+		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error sending list message: %v", instance.Id, err)
 		return nil, err
 	}
 
-	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] List sent to %s", instance.Id, data.Number)
 	return message, nil
 }
 
@@ -2129,21 +2428,46 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 				Participant:   proto.String(data.Quoted.Participant),
 				QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
 			}
-		case "InteractiveMessage":
-			if msg.InteractiveMessage != nil {
-				msg.InteractiveMessage.ContextInfo = &waE2E.ContextInfo{
+		case "ListMessage":
+			if msg.DocumentWithCaptionMessage != nil && msg.DocumentWithCaptionMessage.Message != nil && msg.DocumentWithCaptionMessage.Message.ListMessage != nil {
+				msg.DocumentWithCaptionMessage.Message.ListMessage.ContextInfo = &waE2E.ContextInfo{
 					StanzaID:      proto.String(data.Quoted.MessageID),
 					Participant:   proto.String(data.Quoted.Participant),
 					QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
 				}
-			}
-		case "ListMessage":
-			if msg.ListMessage != nil {
+			} else if msg.ListMessage != nil {
 				msg.ListMessage.ContextInfo = &waE2E.ContextInfo{
 					StanzaID:      proto.String(data.Quoted.MessageID),
 					Participant:   proto.String(data.Quoted.Participant),
 					QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
 				}
+			}
+		case "ButtonsMessage":
+			if msg.DocumentWithCaptionMessage != nil && msg.DocumentWithCaptionMessage.Message != nil && msg.DocumentWithCaptionMessage.Message.ButtonsMessage != nil {
+				msg.DocumentWithCaptionMessage.Message.ButtonsMessage.ContextInfo = &waE2E.ContextInfo{
+					StanzaID:      proto.String(data.Quoted.MessageID),
+					Participant:   proto.String(data.Quoted.Participant),
+					QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
+				}
+			} else if msg.ButtonsMessage != nil {
+				msg.ButtonsMessage.ContextInfo = &waE2E.ContextInfo{
+					StanzaID:      proto.String(data.Quoted.MessageID),
+					Participant:   proto.String(data.Quoted.Participant),
+					QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
+				}
+			}
+		case "InteractiveMessage":
+			quotedCtx := &waE2E.ContextInfo{
+				StanzaID:      proto.String(data.Quoted.MessageID),
+				Participant:   proto.String(data.Quoted.Participant),
+				QuotedMessage: &waE2E.Message{Conversation: proto.String("")},
+			}
+			if msg.DocumentWithCaptionMessage != nil && msg.DocumentWithCaptionMessage.Message != nil && msg.DocumentWithCaptionMessage.Message.InteractiveMessage != nil {
+				msg.DocumentWithCaptionMessage.Message.InteractiveMessage.ContextInfo = quotedCtx
+			} else if msg.ViewOnceMessage != nil && msg.ViewOnceMessage.Message != nil && msg.ViewOnceMessage.Message.InteractiveMessage != nil {
+				msg.ViewOnceMessage.Message.InteractiveMessage.ContextInfo = quotedCtx
+			} else if msg.InteractiveMessage != nil {
+				msg.InteractiveMessage.ContextInfo = quotedCtx
 			}
 		default:
 			return nil, fmt.Errorf("invalid messageType: %s", messageType)
@@ -2179,10 +2503,28 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 			msg.LocationMessage.ContextInfo = &waE2E.ContextInfo{}
 		case "ContactMessage":
 			msg.ContactMessage.ContextInfo = &waE2E.ContextInfo{}
-		case "InteractiveMessage":
-			// ContextInfo already set in SendCarousel/SendButton/SendList
 		case "ListMessage":
-			// ContextInfo already set in SendList
+			if msg.DocumentWithCaptionMessage != nil && msg.DocumentWithCaptionMessage.Message != nil && msg.DocumentWithCaptionMessage.Message.ListMessage != nil {
+				msg.DocumentWithCaptionMessage.Message.ListMessage.ContextInfo = &waE2E.ContextInfo{}
+			} else if msg.ListMessage != nil {
+				msg.ListMessage.ContextInfo = &waE2E.ContextInfo{}
+			}
+		case "ButtonsMessage":
+			if msg.DocumentWithCaptionMessage != nil && msg.DocumentWithCaptionMessage.Message != nil && msg.DocumentWithCaptionMessage.Message.ButtonsMessage != nil {
+				msg.DocumentWithCaptionMessage.Message.ButtonsMessage.ContextInfo = &waE2E.ContextInfo{}
+			} else if msg.ButtonsMessage != nil {
+				msg.ButtonsMessage.ContextInfo = &waE2E.ContextInfo{}
+			}
+		case "InteractiveMessage":
+			if msg.DocumentWithCaptionMessage != nil && msg.DocumentWithCaptionMessage.Message != nil && msg.DocumentWithCaptionMessage.Message.InteractiveMessage != nil {
+				if msg.DocumentWithCaptionMessage.Message.InteractiveMessage.ContextInfo == nil {
+					msg.DocumentWithCaptionMessage.Message.InteractiveMessage.ContextInfo = &waE2E.ContextInfo{}
+				}
+			} else if msg.ViewOnceMessage != nil && msg.ViewOnceMessage.Message != nil && msg.ViewOnceMessage.Message.InteractiveMessage != nil {
+				if msg.ViewOnceMessage.Message.InteractiveMessage.ContextInfo == nil {
+					msg.ViewOnceMessage.Message.InteractiveMessage.ContextInfo = &waE2E.ContextInfo{}
+				}
+			}
 		default:
 			return nil, fmt.Errorf("invalid messageType: %s", messageType)
 		}
@@ -2326,6 +2668,10 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 	if recipient.Server == "newsletter" && data.MediaHandle != "" {
 		sendExtra.MediaHandle = data.MediaHandle
 		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Newsletter detected, using MediaHandle: %s", instance.Id, data.MediaHandle)
+	}
+
+	if data.AdditionalNodes != nil {
+		sendExtra.AdditionalNodes = data.AdditionalNodes
 	}
 
 	response, err := s.clientPointer[instance.Id].SendMessage(context.Background(), recipient, msg, sendExtra)
@@ -2485,7 +2831,6 @@ func (s *sendService) SendCarousel(data *CarouselStruct, instance *instance_mode
 	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Building carousel for %s with %d cards", instance.Id, recipient.String(), len(data.Cards))
 
 	for i, card := range data.Cards {
-		// Each card MUST have both header and body for carousel to work
 		interactiveCard := &waE2E.InteractiveMessage{
 			Body: &waE2E.InteractiveMessage_Body{
 				Text: proto.String(card.Body.Text),
@@ -2502,61 +2847,33 @@ func (s *sendService) SendCarousel(data *CarouselStruct, instance *instance_mode
 			header := interactiveCard.Header
 
 			if card.Header.ImageUrl != "" {
-				// Download image
 				resp, err := http.Get(card.Header.ImageUrl)
 				if err == nil {
-					defer resp.Body.Close()
 					fileData, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
 					if err == nil {
 						uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaImage)
 						if err == nil {
-							// Generate JPEG thumbnail for iOS compatibility
-							var jpegThumb []byte
-							img, _, decErr := image.Decode(bytes.NewReader(fileData))
-							if decErr == nil {
-								// Resize to 72px thumbnail
-								bounds := img.Bounds()
-								thumbWidth := 72
-								thumbHeight := int(float64(bounds.Dy()) * float64(thumbWidth) / float64(bounds.Dx()))
-								if thumbHeight < 1 {
-									thumbHeight = 1
-								}
-								thumbImg := image.NewRGBA(image.Rect(0, 0, thumbWidth, thumbHeight))
-								for y := 0; y < thumbHeight; y++ {
-									for x := 0; x < thumbWidth; x++ {
-										srcX := x * bounds.Dx() / thumbWidth
-										srcY := y * bounds.Dy() / thumbHeight
-										thumbImg.Set(x, y, img.At(srcX+bounds.Min.X, srcY+bounds.Min.Y))
-									}
-								}
-								var thumbBuf bytes.Buffer
-								if jpeg.Encode(&thumbBuf, thumbImg, &jpeg.Options{Quality: 50}) == nil {
-									jpegThumb = thumbBuf.Bytes()
-								}
-							}
-
 							header.HasMediaAttachment = proto.Bool(true)
 							header.Media = &waE2E.InteractiveMessage_Header_ImageMessage{
 								ImageMessage: &waE2E.ImageMessage{
-									URL:            proto.String(uploaded.URL),
-									DirectPath:     proto.String(uploaded.DirectPath),
-									MediaKey:       uploaded.MediaKey,
-									Mimetype:       proto.String("image/jpeg"),
-									FileEncSHA256:  uploaded.FileEncSHA256,
-									FileSHA256:     uploaded.FileSHA256,
-									FileLength:     proto.Uint64(uint64(len(fileData))),
-									JPEGThumbnail:  jpegThumb,
+									URL:           proto.String(uploaded.URL),
+									DirectPath:    proto.String(uploaded.DirectPath),
+									MediaKey:      uploaded.MediaKey,
+									Mimetype:      proto.String("image/jpeg"),
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    proto.Uint64(uint64(len(fileData))),
 								},
 							}
 						}
 					}
 				}
 			} else if card.Header.VideoUrl != "" {
-				// Download and upload video
 				resp, err := http.Get(card.Header.VideoUrl)
 				if err == nil {
-					defer resp.Body.Close()
 					fileData, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
 					if err == nil {
 						uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo)
 						if err == nil {
@@ -2591,7 +2908,7 @@ func (s *sendService) SendCarousel(data *CarouselStruct, instance *instance_mode
 			for j, btn := range card.Buttons {
 				buttonType := strings.ToUpper(btn.Type)
 				if buttonType == "" {
-					buttonType = "REPLY" // Default type
+					buttonType = "REPLY"
 				}
 
 				var buttonName string
@@ -2599,23 +2916,39 @@ func (s *sendService) SendCarousel(data *CarouselStruct, instance *instance_mode
 
 				switch buttonType {
 				case "URL":
-					// URL button - opens a link
 					buttonName = "cta_url"
-					buttonParams = fmt.Sprintf(`{"display_text":"%s","url":"%s"}`, btn.DisplayText, btn.Id)
+					btnURL := btn.URL
+					if btnURL == "" {
+						btnURL = btn.Id
+					}
+					jsonBytes, _ := json.Marshal(map[string]string{"display_text": btn.DisplayText, "url": btnURL, "merchant_url": btnURL})
+					buttonParams = string(jsonBytes)
 				case "CALL":
-					// Call button - initiates a phone call
 					buttonName = "cta_call"
-					buttonParams = fmt.Sprintf(`{"display_text":"%s","phone_number":"%s"}`, btn.DisplayText, btn.Id)
+					phone := btn.PhoneNumber
+					if phone == "" {
+						phone = btn.Id
+					}
+					jsonBytes, _ := json.Marshal(map[string]string{"display_text": btn.DisplayText, "phone_number": phone})
+					buttonParams = string(jsonBytes)
 				case "COPY":
-					// Copy button - copies text to clipboard
 					buttonName = "cta_copy"
-					buttonParams = fmt.Sprintf(`{"display_text":"%s","copy_code":"%s"}`, btn.DisplayText, btn.CopyCode)
+					copyCode := btn.CopyCode
+					if copyCode == "" {
+						copyCode = btn.Id
+					}
+					copyId := btn.Id
+					if copyId == "" {
+						copyId = "copy_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+					}
+					jsonBytes, _ := json.Marshal(map[string]string{"display_text": btn.DisplayText, "id": copyId, "copy_code": copyCode})
+					buttonParams = string(jsonBytes)
 				case "REPLY":
 					fallthrough
 				default:
-					// Quick reply button (default)
 					buttonName = "quick_reply"
-					buttonParams = fmt.Sprintf(`{"display_text":"%s","id":"%s"}`, btn.DisplayText, btn.Id)
+					jsonBytes, _ := json.Marshal(map[string]string{"display_text": btn.DisplayText, "id": btn.Id})
+					buttonParams = string(jsonBytes)
 				}
 
 				buttons[j] = &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
@@ -2624,11 +2957,14 @@ func (s *sendService) SendCarousel(data *CarouselStruct, instance *instance_mode
 				}
 			}
 
-			// Cards in carousel: do NOT set MessageParamsJSON or MessageVersion
-			// (matching PAPI Node.js behavior for iOS compatibility)
+			templateId := strconv.FormatInt(time.Now().UnixNano()/1000000, 10)
+			messageParamsJSON := `{"from":"api","templateId":` + templateId + `}`
+
 			interactiveCard.InteractiveMessage = &waE2E.InteractiveMessage_NativeFlowMessage_{
 				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-					Buttons: buttons,
+					Buttons:           buttons,
+					MessageParamsJSON: proto.String(messageParamsJSON),
+					MessageVersion:    proto.Int32(1),
 				},
 			}
 		}
@@ -2636,12 +2972,14 @@ func (s *sendService) SendCarousel(data *CarouselStruct, instance *instance_mode
 		cards[i] = interactiveCard
 	}
 
-	// Build carousel message (do NOT set CarouselCardType - matching PAPI Node.js for iOS)
+	// Build carousel message with HSCROLL_CARDS type
+	carouselCardType := waE2E.InteractiveMessage_CarouselMessage_HSCROLL_CARDS
 	interactiveMsg := &waE2E.InteractiveMessage{
 		InteractiveMessage: &waE2E.InteractiveMessage_CarouselMessage_{
 			CarouselMessage: &waE2E.InteractiveMessage_CarouselMessage{
-				Cards:          cards,
-				MessageVersion: &messageVersion,
+				Cards:            cards,
+				MessageVersion:   &messageVersion,
+				CarouselCardType: &carouselCardType,
 			},
 		},
 	}
@@ -2660,35 +2998,22 @@ func (s *sendService) SendCarousel(data *CarouselStruct, instance *instance_mode
 		}
 	}
 
-	// ContextInfo is REQUIRED for iOS compatibility
-	// Even if empty, iOS requires this field to display carousel
-	contextInfo := &waE2E.ContextInfo{}
+	// Generate MessageSecret (32 random bytes) required for iOS to render
+	msgSecret := make([]byte, 32)
+	crypto_rand.Read(msgSecret)
 
-	// Add quoted message if exists
-	if data.Quoted.MessageID != "" {
-		contextInfo.StanzaID = proto.String(data.Quoted.MessageID)
-		if data.Quoted.Participant != "" {
-			participantJID, ok := utils.ParseJID(data.Quoted.Participant)
-			if ok {
-				contextInfo.Participant = proto.String(participantJID.String())
-			}
-		}
-	}
-
-	// Always set ContextInfo (required for iOS)
-	interactiveMsg.ContextInfo = contextInfo
-
-	// Build final message with MessageContextInfo for proper notification delivery
+	// Carousel: direct InteractiveMessage (NOT wrapped in ViewOnceMessage)
 	msg := &waE2E.Message{
 		InteractiveMessage: interactiveMsg,
 		MessageContextInfo: &waE2E.MessageContextInfo{
-			DeviceListMetadata: &waE2E.DeviceListMetadata{},
+			MessageSecret: msgSecret,
 		},
 	}
 
 	message, err := s.SendMessage(instance, msg, "InteractiveMessage", &SendDataStruct{
 		Number: data.Number,
 		Delay:  data.Delay,
+		Quoted: data.Quoted,
 	})
 
 	if err != nil {

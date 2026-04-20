@@ -23,6 +23,7 @@ type SendHandler interface {
 	SendButton(ctx *gin.Context)
 	SendList(ctx *gin.Context)
 	SendCarousel(ctx *gin.Context)
+	SendPix(ctx *gin.Context)
 	SendStatusText(ctx *gin.Context)
 	SendStatusMedia(ctx *gin.Context)
 }
@@ -679,6 +680,72 @@ func (s *sendHandler) SendCarousel(ctx *gin.Context) {
 	}
 
 	message, err := s.sendMessageService.SendCarousel(data, instance)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": message})
+}
+
+// Send a PIX payment message
+// @Summary Send a PIX payment message
+// @Description Send a PIX payment interactive message via WhatsApp
+// @Tags Send Message
+// @Accept json
+// @Produce json
+// @Param message body send_service.PixStruct true "PIX payment data"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /send/pix [post]
+func (s *sendHandler) SendPix(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	var data *send_service.PixStruct
+	err := ctx.ShouldBindBodyWithJSON(&data)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if data.Number == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "phone number is required"})
+		return
+	}
+
+	if data.HeaderTitle == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "headerTitle is required"})
+		return
+	}
+
+	if data.BodyText == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "bodyText is required"})
+		return
+	}
+
+	if data.MerchantName == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "merchantName is required"})
+		return
+	}
+
+	if data.PixKey == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "pixKey is required"})
+		return
+	}
+
+	if data.KeyType == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "keyType is required (CPF, CNPJ, EMAIL, PHONE, EVP)"})
+		return
+	}
+
+	message, err := s.sendMessageService.SendPix(data, instance)
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
