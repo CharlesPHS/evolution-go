@@ -1,0 +1,47 @@
+version: "3.9"
+services:
+  evolution-go:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: evolution-go
+    restart: always
+    ports:
+      - "127.0.0.1:8188:8080"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - evolution_instances:/app/instances
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - evolution-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: evolution-go-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: evogo_usr
+      POSTGRES_PASSWORD: Ev0g0X9q2mRkL7pQ
+      POSTGRES_DB: evogo
+    volumes:
+      - postgres_data_v2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evogo_usr -d evogo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - evolution-net
+
+volumes:
+  evolution_instances:
+  postgres_data_v2:
+
+networks:
+  evolution-net:
+    driver: bridge
