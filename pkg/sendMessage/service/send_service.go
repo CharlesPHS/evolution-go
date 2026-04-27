@@ -1927,148 +1927,43 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 	crypto_rand.Read(btnMsgSecret)
 
 	if hasReply && !hasOtherTypes && !hasPayment {
-		// Reply-only buttons: use native ButtonsMessage wrapped in DocumentWithCaptionMessage
-		var replyButtons []*waE2E.ButtonsMessage_Button
-		for _, v := range data.Buttons {
-			replyButtons = append(replyButtons, &waE2E.ButtonsMessage_Button{
-				ButtonID: proto.String(v.Id),
-				ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
-					DisplayText: proto.String(v.DisplayText),
-				},
-				Type: waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
-			})
-		}
+		// Reply buttons: use InteractiveMessage NativeFlow wrapped in DocumentWithCaptionMessage.
+		// ButtonsMessage is deprecated and no longer renders on modern WhatsApp Android/iOS.
+		templateId := strconv.FormatInt(time.Now().UnixNano()/1000000, 10)
+		messageParamsJSON := `{"from":"api","templateId":` + templateId + `}`
 
-		buttonsMsg := &waE2E.ButtonsMessage{
-			ContentText: proto.String(data.Description),
-			FooterText:  proto.String(data.Footer),
-			HeaderType:  waE2E.ButtonsMessage_EMPTY.Enum(),
-			Buttons:     replyButtons,
+		bodyText := data.Description
+		if bodyText == "" {
+			bodyText = data.Title
 		}
-
-		// If imageUrl is provided, download, upload and set as header
-		if data.ImageUrl != "" {
-			resp, err := http.Get(data.ImageUrl)
-			if err == nil {
-				fileData, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if err == nil {
-					client, _ := s.ensureClientConnected(instance.Id)
-					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaImage)
-					if err == nil {
-						buttonsMsg.HeaderType = waE2E.ButtonsMessage_IMAGE.Enum()
-						buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
-							ImageMessage: &waE2E.ImageMessage{
-								URL:           proto.String(uploaded.URL),
-								DirectPath:    proto.String(uploaded.DirectPath),
-								MediaKey:      uploaded.MediaKey,
-								Mimetype:      proto.String("image/jpeg"),
-								FileEncSHA256: uploaded.FileEncSHA256,
-								FileSHA256:    uploaded.FileSHA256,
-								FileLength:    proto.Uint64(uint64(len(fileData))),
-							},
-						}
-					}
-				}
-			}
-		} else if data.VideoUrl != "" {
-			resp, err := http.Get(data.VideoUrl)
-			if err == nil {
-				fileData, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if err == nil {
-					client, _ := s.ensureClientConnected(instance.Id)
-					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo)
-					if err == nil {
-						buttonsMsg.HeaderType = waE2E.ButtonsMessage_VIDEO.Enum()
-						buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
-							VideoMessage: &waE2E.VideoMessage{
-								URL:           proto.String(uploaded.URL),
-								DirectPath:    proto.String(uploaded.DirectPath),
-								MediaKey:      uploaded.MediaKey,
-								Mimetype:      proto.String("video/mp4"),
-								FileEncSHA256: uploaded.FileEncSHA256,
-								FileSHA256:    uploaded.FileSHA256,
-								FileLength:    proto.Uint64(uint64(len(fileData))),
-							},
-						}
-					}
-				}
-			}
-		}
-
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					ButtonsMessage: buttonsMsg,
-				},
-			},
-			MessageContextInfo: &waE2E.MessageContextInfo{
-				MessageSecret: btnMsgSecret,
-			},
-		}
-		msgType = "ButtonsMessage"
-	} else if hasPayment {
-		// review_and_pay: wrap in DocumentWithCaptionMessage
-		paymentMsgParams := `{"native_flow_name":"order_details","version":1}`
-
-		var interactiveBody *waE2E.InteractiveMessage_Body
-		if data.Title != "" {
-			bodyText := data.Title
-			interactiveBody = &waE2E.InteractiveMessage_Body{
-				Text: &bodyText,
-			}
-		}
-
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					InteractiveMessage: &waE2E.InteractiveMessage{
-						Body: interactiveBody,
-						InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
-							NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-								Buttons:           buttons,
-								MessageParamsJSON: &paymentMsgParams,
-								MessageVersion:    proto.Int32(1),
-							},
-						},
-					},
-				},
-			},
-			MessageContextInfo: &waE2E.MessageContextInfo{
-				MessageSecret: btnMsgSecret,
-			},
-		}
-		msgType = "InteractiveMessage"
-	} else {
-		// Mixed button types (url, copy, call) use InteractiveMessage DIRECT
-		body := func() string {
-			t := "*" + data.Title + "*"
-			if data.Description != "" {
-				t += "\n\n" + data.Description + "\n"
-			}
-			return t
-		}()
 
 		interactive := &waE2E.InteractiveMessage{
 			Body: &waE2E.InteractiveMessage_Body{
-				Text: &body,
+				Text: &bodyText,
 			},
 			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
 				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
 					Buttons:           buttons,
-					MessageParamsJSON: proto.String(""),
+					MessageParamsJSON: &messageParamsJSON,
 					MessageVersion:    proto.Int32(1),
 				},
 			},
 		}
+
+		if data.Title != "" && data.Description != "" {
+			interactive.Header = &waE2E.InteractiveMessage_Header{
+				Title:              proto.String(data.Title),
+				HasMediaAttachment: proto.Bool(false),
+			}
+		}
+
 		if data.Footer != "" {
 			interactive.Footer = &waE2E.InteractiveMessage_Footer{
 				Text: &data.Footer,
 			}
 		}
 
-		// Add image or video header if provided
+		// Image/video header for reply buttons
 		if data.ImageUrl != "" {
 			resp, err := http.Get(data.ImageUrl)
 			if err == nil {
@@ -2126,7 +2021,146 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 		}
 
 		msg = &waE2E.Message{
-			InteractiveMessage: interactive,
+			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{
+					InteractiveMessage: interactive,
+				},
+			},
+			MessageContextInfo: &waE2E.MessageContextInfo{
+				MessageSecret: btnMsgSecret,
+			},
+		}
+		msgType = "InteractiveMessage"
+	} else if hasPayment {
+		// review_and_pay: wrap in DocumentWithCaptionMessage
+		paymentMsgParams := `{"native_flow_name":"order_details","version":1}`
+
+		var interactiveBody *waE2E.InteractiveMessage_Body
+		if data.Title != "" {
+			bodyText := data.Title
+			interactiveBody = &waE2E.InteractiveMessage_Body{
+				Text: &bodyText,
+			}
+		}
+
+		msg = &waE2E.Message{
+			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{
+					InteractiveMessage: &waE2E.InteractiveMessage{
+						Body: interactiveBody,
+						InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+							NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+								Buttons:           buttons,
+								MessageParamsJSON: &paymentMsgParams,
+								MessageVersion:    proto.Int32(1),
+							},
+						},
+					},
+				},
+			},
+			MessageContextInfo: &waE2E.MessageContextInfo{
+				MessageSecret: btnMsgSecret,
+			},
+		}
+		msgType = "InteractiveMessage"
+	} else {
+		// CTA buttons (url, copy, call): InteractiveMessage wrapped in DocumentWithCaptionMessage
+		templateId := strconv.FormatInt(time.Now().UnixNano()/1000000, 10)
+		messageParamsJSON := `{"from":"api","templateId":` + templateId + `}`
+
+		bodyText := data.Description
+		if bodyText == "" {
+			bodyText = data.Title
+		}
+
+		interactive := &waE2E.InteractiveMessage{
+			Body: &waE2E.InteractiveMessage_Body{
+				Text: &bodyText,
+			},
+			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+					Buttons:           buttons,
+					MessageParamsJSON: &messageParamsJSON,
+					MessageVersion:    proto.Int32(1),
+				},
+			},
+		}
+
+		if data.Title != "" && data.Description != "" {
+			interactive.Header = &waE2E.InteractiveMessage_Header{
+				Title:              proto.String(data.Title),
+				HasMediaAttachment: proto.Bool(false),
+			}
+		}
+
+		if data.Footer != "" {
+			interactive.Footer = &waE2E.InteractiveMessage_Footer{
+				Text: &data.Footer,
+			}
+		}
+
+		if data.ImageUrl != "" {
+			resp, err := http.Get(data.ImageUrl)
+			if err == nil {
+				fileData, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					client, _ := s.ensureClientConnected(instance.Id)
+					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaImage)
+					if err == nil {
+						interactive.Header = &waE2E.InteractiveMessage_Header{
+							Title:              proto.String(""),
+							HasMediaAttachment: proto.Bool(true),
+							Media: &waE2E.InteractiveMessage_Header_ImageMessage{
+								ImageMessage: &waE2E.ImageMessage{
+									URL:           proto.String(uploaded.URL),
+									DirectPath:    proto.String(uploaded.DirectPath),
+									MediaKey:      uploaded.MediaKey,
+									Mimetype:      proto.String("image/jpeg"),
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    proto.Uint64(uint64(len(fileData))),
+								},
+							},
+						}
+					}
+				}
+			}
+		} else if data.VideoUrl != "" {
+			resp, err := http.Get(data.VideoUrl)
+			if err == nil {
+				fileData, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					client, _ := s.ensureClientConnected(instance.Id)
+					uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo)
+					if err == nil {
+						interactive.Header = &waE2E.InteractiveMessage_Header{
+							Title:              proto.String(""),
+							HasMediaAttachment: proto.Bool(true),
+							Media: &waE2E.InteractiveMessage_Header_VideoMessage{
+								VideoMessage: &waE2E.VideoMessage{
+									URL:           proto.String(uploaded.URL),
+									DirectPath:    proto.String(uploaded.DirectPath),
+									MediaKey:      uploaded.MediaKey,
+									Mimetype:      proto.String("video/mp4"),
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    proto.Uint64(uint64(len(fileData))),
+								},
+							},
+						}
+					}
+				}
+			}
+		}
+
+		msg = &waE2E.Message{
+			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{
+					InteractiveMessage: interactive,
+				},
+			},
 			MessageContextInfo: &waE2E.MessageContextInfo{
 				MessageSecret: btnMsgSecret,
 			},
