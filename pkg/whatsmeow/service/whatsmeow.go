@@ -1658,7 +1658,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					var message message_model.Message
 
 					message.MessageID = v
-					message.Timestamp = evt.Timestamp.Format("2006-01-02 15:04:05")
+					message.Timestamp = evt.Timestamp
 					message.Status = "Read"
 					message.Source = evt.Chat.ToNonAD().User
 
@@ -1675,7 +1675,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			var message message_model.Message
 
 			message.MessageID = evt.MessageIDs[0]
-			message.Timestamp = evt.Timestamp.Format("2006-01-02 15:04:05")
+			message.Timestamp = evt.Timestamp
 			message.Status = "Delivered"
 			message.Source = evt.Chat.ToNonAD().User
 
