@@ -1778,17 +1778,15 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			},
 		}
 	} else {
-		body := func() string {
-			t := "*" + data.Title + "*"
-			if data.Description != "" {
-				t += "\n\n" + data.Description + "\n"
-			}
-			return t
-		}()
+		// Body carries only the description; title goes in the Header to avoid duplication.
+		bodyText := data.Description
+		if bodyText == "" {
+			bodyText = data.Title
+		}
 
 		interactiveMsg := &waE2E.InteractiveMessage{
 			Body: &waE2E.InteractiveMessage_Body{
-				Text: &body,
+				Text: &bodyText,
 			},
 			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
 				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
@@ -1800,14 +1798,12 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			ContextInfo: &waE2E.ContextInfo{},
 		}
 
-		// Footer conditional - only add if not empty (iOS compatibility)
 		if data.Footer != "" {
 			interactiveMsg.Footer = &waE2E.InteractiveMessage_Footer{
 				Text: &data.Footer,
 			}
 		}
 
-		// Header with title
 		if data.Title != "" {
 			interactiveMsg.Header = &waE2E.InteractiveMessage_Header{
 				Title:              proto.String(data.Title),
