@@ -2,6 +2,7 @@ package message_handler
 
 import (
 	"net/http"
+	"strconv"
 
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	message_service "github.com/EvolutionAPI/evolution-go/pkg/message/service"
@@ -16,6 +17,8 @@ type MessageHandler interface {
 	GetMessageStatus(ctx *gin.Context)
 	DeleteMessageEveryone(ctx *gin.Context)
 	EditMessage(ctx *gin.Context)
+	GetChatMessages(ctx *gin.Context)
+	ListChats(ctx *gin.Context)
 }
 
 type messageHandler struct {
@@ -360,6 +363,87 @@ func (m *messageHandler) EditMessage(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": responseData})
+}
+
+// GetChatMessages returns messages from a specific chat
+// @Summary Get chat messages
+// @Description Returns paginated messages from a specific chat for the current instance
+// @Tags Message
+// @Produce json
+// @Param chat query string true "Chat JID (e.g. 5511999887766@s.whatsapp.net)"
+// @Param limit query int false "Max number of messages (default 50)"
+// @Param offset query int false "Offset for pagination (default 0)"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "bad request"
+// @Failure 500 {object} gin.H "internal server error"
+// @Router /message/chat [get]
+func (m *messageHandler) GetChatMessages(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	chat := ctx.Query("chat")
+	if chat == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "chat is required"})
+		return
+	}
+
+	limit := 50
+	offset := 0
+	if l := ctx.Query("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	if o := ctx.Query("offset"); o != "" {
+		if v, err := strconv.Atoi(o); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+
+	messages, err := m.messageService.GetChatMessages(instance, chat, limit, offset)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": messages})
+}
+
+// ListChats returns the last message preview for each chat in the instance
+// @Summary List chats preview
+// @Description Returns the latest message per chat for the current instance
+// @Tags Message
+// @Produce json
+// @Param limit query int false "Max number of chats (default 50)"
+// @Success 200 {object} gin.H "success"
+// @Failure 500 {object} gin.H "internal server error"
+// @Router /message/chats [get]
+func (m *messageHandler) ListChats(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	limit := 50
+	if l := ctx.Query("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = v
+		}
+	}
+
+	chats, err := m.messageService.ListChats(instance, limit)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": chats})
 }
 
 func NewMessageHandler(

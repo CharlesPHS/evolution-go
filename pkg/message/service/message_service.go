@@ -31,6 +31,8 @@ type MessageService interface {
 	GetMessageStatus(data *MessageStatusStruct, instance *instance_model.Instance) (*message_model.Message, string, error)
 	DeleteMessageEveryone(data *MessageStruct, instance *instance_model.Instance) (string, string, error)
 	EditMessage(data *EditMessageStruct, instance *instance_model.Instance) (string, string, error)
+	GetChatMessages(instance *instance_model.Instance, chat string, limit, offset int) ([]message_model.Message, error)
+	ListChats(instance *instance_model.Instance, limit int) ([]message_model.Message, error)
 }
 
 type messageService struct {
@@ -421,6 +423,14 @@ func (m *messageService) EditMessage(data *EditMessageStruct, instance *instance
 	}
 
 	return resp.ID, resp.Timestamp.String(), nil
+}
+
+func (m *messageService) GetChatMessages(instance *instance_model.Instance, chat string, limit, offset int) ([]message_model.Message, error) {
+	return m.messageRepository.GetChatMessages(instance.Id, chat, limit, offset)
+}
+
+func (m *messageService) ListChats(instance *instance_model.Instance, limit int) ([]message_model.Message, error) {
+	return m.messageRepository.ListChats(instance.Id, limit)
 }
 
 func NewMessageService(

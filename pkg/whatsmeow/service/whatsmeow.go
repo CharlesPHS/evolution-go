@@ -1605,6 +1605,26 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 
+		if mycli.config.DatabaseSaveMessages {
+			go func() {
+				msg := message_model.Message{
+					InstanceId:      mycli.Instance.Id,
+					MessageID:       evt.Info.ID,
+					Timestamp:       evt.Info.Timestamp,
+					Status:          "Received",
+					Source:          evt.Info.Sender.ToNonAD().String(),
+					Chat:            evt.Info.Chat.ToNonAD().String(),
+					FromMe:          evt.Info.IsFromMe,
+					Content:         extractMessageText(evt.Message),
+					MessageType:     parsedMessageType,
+					QuotedMessageID: stanzaID,
+				}
+				if err := mycli.messageRepository.InsertMessage(msg); err != nil {
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to save message to database: %v", mycli.userID, err)
+				}
+			}()
+		}
+
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== MESSAGE PROCESSING COMPLETED ===== ID: %s, From: %s, Type: %s, Webhook: %v", mycli.userID, evt.Info.ID, evt.Info.Chat.String(), evt.Info.Type, doWebhook)
 	case *events.Receipt:
 		doWebhook = true
@@ -2696,6 +2716,32 @@ func (w *whatsmeowService) GetPollService() poll_service.PollService {
 
 // cleanSenderID remove a parte ":numero" do sender ID para exibir apenas o remoteJid correto
 // Exemplo: "557499879409:3@s.whatsapp.net" -> "557499879409@s.whatsapp.net"
+// extractMessageText retorna o texto legível de uma mensagem WhatsApp.
+func extractMessageText(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if msg.Conversation != nil {
+		return *msg.Conversation
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil && ext.Text != nil {
+		return *ext.Text
+	}
+	if img := msg.GetImageMessage(); img != nil && img.Caption != nil {
+		return *img.Caption
+	}
+	if vid := msg.GetVideoMessage(); vid != nil && vid.Caption != nil {
+		return *vid.Caption
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil && doc.FileName != nil {
+		return *doc.FileName
+	}
+	if loc := msg.GetLocationMessage(); loc != nil {
+		return fmt.Sprintf("%.6f,%.6f", loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
+	}
+	return ""
+}
+
 func cleanSenderID(senderID string) string {
 	// Procura pelo padrão ":numero" antes do @
 	if colonIndex := strings.Index(senderID, ":"); colonIndex != -1 {

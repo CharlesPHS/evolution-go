@@ -11,6 +11,8 @@ type MessageRepository interface {
 	GetMessageByID(messageID string) (*message_model.Message, error)
 	DeleteAllMessages() (int64, error)
 	GetLatestMessageID(source string) (string, string, error)
+	GetChatMessages(instanceId, chat string, limit, offset int) ([]message_model.Message, error)
+	ListChats(instanceId string, limit int) ([]message_model.Message, error)
 }
 
 type messageRepository struct {
@@ -20,7 +22,7 @@ type messageRepository struct {
 func (m *messageRepository) InsertMessage(message message_model.Message) error {
 	return m.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "message_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"timestamp", "status", "source"}),
+		DoUpdates: clause.AssignmentColumns([]string{"timestamp", "status", "source", "chat", "from_me", "content", "message_type", "quoted_message_id"}),
 	}).Create(&message).Error
 }
 
@@ -33,7 +35,6 @@ func (m *messageRepository) GetMessageByID(messageID string) (*message_model.Mes
 		}
 		return nil, err
 	}
-
 	return &message, nil
 }
 
@@ -51,8 +52,44 @@ func (m *messageRepository) GetLatestMessageID(source string) (string, string, e
 		}
 		return "", "", err
 	}
+	return message.MessageID, message.Timestamp.Format("2006-01-02 15:04:05"), nil
+}
 
-	return message.MessageID, message.Timestamp, nil
+// GetChatMessages retorna mensagens de um chat específico, ordenadas da mais recente para a mais antiga.
+func (m *messageRepository) GetChatMessages(instanceId, chat string, limit, offset int) ([]message_model.Message, error) {
+	var messages []message_model.Message
+	query := m.db.Where("instance_id = ? AND chat = ?", instanceId, chat).
+		Order("timestamp DESC")
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	if offset > 0 {
+		query = query.Offset(offset)
+	}
+	err := query.Find(&messages).Error
+	return messages, err
+}
+
+// ListChats retorna a última mensagem de cada chat da instância (preview de conversas).
+func (m *messageRepository) ListChats(instanceId string, limit int) ([]message_model.Message, error) {
+	var messages []message_model.Message
+
+	subQuery := m.db.Model(&message_model.Message{}).
+		Select("MAX(timestamp) as max_ts, chat").
+		Where("instance_id = ?", instanceId).
+		Group("chat")
+
+	query := m.db.Model(&message_model.Message{}).
+		Joins("JOIN (?) as latest ON messages.chat = latest.chat AND messages.timestamp = latest.max_ts", subQuery).
+		Where("messages.instance_id = ?", instanceId).
+		Order("messages.timestamp DESC")
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	err := query.Find(&messages).Error
+	return messages, err
 }
 
 func NewMessageRepository(db *gorm.DB) MessageRepository {
